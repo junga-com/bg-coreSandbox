@@ -1,0 +1,9 @@
+.bglocal/
+tags
+pkgControl/files
+*.changes
+*.deb
+*.rpm
+*.upload
+lib/refFrom-bg-Lib
+.todo.md
