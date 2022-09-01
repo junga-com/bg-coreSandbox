@@ -1,0 +1,9 @@
+[submodule "bg-core"]
+	path = bg-core
+	url = ../bg-core
+[submodule "bg-dev"]
+	path = bg-dev
+	url = ../bg-dev
+[submodule "bg-core-bash-builtins"]
+	path = bg-core-bash-builtins
+	url = ../bg-core-bash-builtins
