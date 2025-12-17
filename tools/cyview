@@ -1,0 +1,262 @@
+#!/usr/bin/env python3
+import argparse
+import json
+import os
+import shutil
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
+from pathlib import Path
+
+HTML_TEMPLATE = """<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>CYJS Viewer</title>
+  <script src="https://unpkg.com/cytoscape@3.25.0/dist/cytoscape.min.js"></script>
+  <style>
+    html, body, #cy { width: 100%; height: 100%; margin: 0; }
+    #info {
+      position: fixed;
+      top: 8px;
+      left: 8px;
+      background: rgba(255,255,255,0.92);
+      padding: 8px;
+      border-radius: 8px;
+      font-family: sans-serif;
+      font-size: 13px;
+      max-width: 45vw;
+      white-space: pre;
+    }
+  </style>
+</head>
+<body>
+  <div id="cy"></div>
+  <div id="info">Click a node or edge…</div>
+
+  <script>
+    async function main() {
+      const res = await fetch("__CYJS_FILE__");
+      const cyjs = await res.json();
+
+      const cy = cytoscape({
+        container: document.getElementById("cy"),
+        elements: cyjs.elements,
+        layout: { name: "cose" },
+        style: [
+          { selector: "node", style: {
+              "label": "data(label)",
+              "text-valign": "center",
+              "background-color": "#4f7cff",
+              "color": "#fff"
+          }},
+          { selector: "edge", style: {
+              "curve-style": "bezier",
+              "target-arrow-shape": "triangle",
+              "line-color": "#999",
+              "target-arrow-color": "#999"
+          }}
+        ]
+      });
+
+      const info = document.getElementById("info");
+      cy.on("tap", "node,edge", e => {
+        info.textContent = JSON.stringify(e.target.data(), null, 2);
+      });
+    }
+
+    main();
+  </script>
+</body>
+</html>
+"""
+
+class QuietHandler(SimpleHTTPRequestHandler):
+    # suppress routine GET logging
+    def log_message(self, format, *args):
+        return
+
+def pick_port() -> int:
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+def have_gui() -> bool:
+    return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+
+def find_chromium():
+    for name in ("chromium", "chromium-browser", "google-chrome", "google-chrome-stable", "microsoft-edge"):
+        path = shutil.which(name)
+        if path:
+            return path
+    return None
+
+def read_cyjs_from_stdin() -> str:
+    data = sys.stdin.read()
+    if not data.strip():
+        raise ValueError("No CYJS content received on stdin.")
+    # basic sanity: ensure it's JSON
+    json.loads(data)
+    return data
+
+def read_cyjs_from_file(path: Path) -> str:
+    data = path.read_text(encoding="utf-8")
+    json.loads(data)
+    return data
+
+def write_session_files(session_dir: Path, cyjs_text: str, cyjs_filename: str = "graph.cyjs") -> Path:
+    cyjs_path = session_dir / cyjs_filename
+    cyjs_path.write_text(cyjs_text, encoding="utf-8")
+    (session_dir / "viewer.html").write_text(
+        HTML_TEMPLATE.replace("__CYJS_FILE__", cyjs_filename),
+        encoding="utf-8",
+    )
+    return cyjs_path
+
+def run_server(docroot: Path, port: int):
+    os.chdir(docroot)
+    httpd = ThreadingHTTPServer(("127.0.0.1", port), QuietHandler)
+    return httpd
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument(
+        "input",
+        nargs="?",
+        default=None,
+        help="Path to .cyjs file, or '-' to read from stdin. If omitted, reads stdin when piped.",
+    )
+    ap.add_argument("--ui", choices=["auto", "chromium", "xdg-open"], default="auto",
+                    help="UI launch mode. auto prefers chromium app mode if available, else xdg-open.")
+    ap.add_argument("--keep-alive", action="store_true",
+                    help="Don't auto-exit when chromium closes (debug).")
+    args = ap.parse_args()
+
+    # Decide input source
+    piped = not sys.stdin.isatty()
+    from_stdin = (args.input == "-") or (args.input is None and piped)
+
+    try:
+        if from_stdin:
+            cyjs_text = read_cyjs_from_stdin()
+            src_label = "stdin"
+        elif args.input:
+            p = Path(args.input).expanduser().resolve()
+            cyjs_text = read_cyjs_from_file(p)
+            src_label = str(p)
+        else:
+            print("cyview: no input provided. Pass a .cyjs file, '-' for stdin, or pipe data into cyview.", file=sys.stderr)
+            return 2
+    except Exception as e:
+        print(f"cyview: failed to read/parse CYJS from {('stdin' if from_stdin else args.input)}: {e}", file=sys.stderr)
+        return 2
+
+    chromium = find_chromium()
+    prefer_chromium = (args.ui == "chromium") or (args.ui == "auto" and chromium is not None)
+
+    use_chromium = prefer_chromium and chromium is not None and have_gui()
+    if prefer_chromium and not have_gui():
+        # If user explicitly requested chromium, show why it won't work.
+        if args.ui == "chromium":
+            print("cyview: --ui chromium requested but no GUI detected (DISPLAY/WAYLAND_DISPLAY unset).", file=sys.stderr)
+            return 2
+
+    # Create an isolated session directory for viewer assets (and for CYJS content too)
+    with tempfile.TemporaryDirectory(prefix="cyview-session-") as td:
+        session_dir = Path(td)
+
+        # If input is a file, preserve its basename so it shows nicely in debugging.
+        if not from_stdin and args.input:
+            cyjs_filename = Path(args.input).name
+            if not cyjs_filename.lower().endswith(".cyjs"):
+                cyjs_filename = cyjs_filename + ".cyjs"
+        else:
+            cyjs_filename = "graph.cyjs"
+
+        write_session_files(session_dir, cyjs_text, cyjs_filename=cyjs_filename)
+
+        port = pick_port()
+        httpd = run_server(session_dir, port)
+
+        server_thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        server_thread.start()
+
+        url = f"http://127.0.0.1:{port}/viewer.html"
+
+        if use_chromium:
+            # Give chromium a unique profile to avoid "profile in use" immediate-exit.
+            profile_dir = tempfile.mkdtemp(prefix="cyview-chromium-profile-")
+            try:
+                proc = subprocess.Popen(
+                    [
+                        chromium,
+                        "--new-window",
+                        f"--app={url}",
+                        "--window-size=1400,900",
+                        "--no-first-run",
+                        "--no-default-browser-check",
+                        "--disable-translate",
+                        f"--user-data-dir={profile_dir}",
+                    ],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+
+                # Detect "exits immediately" and show stderr.
+                time.sleep(0.6)
+                rc = proc.poll()
+                if rc is not None:
+                    out, err = proc.communicate(timeout=2)
+                    print("cyview: chromium exited immediately.", file=sys.stderr)
+                    if err.strip():
+                        print("chromium stderr:", file=sys.stderr)
+                        print(err.rstrip(), file=sys.stderr)
+                    if out.strip():
+                        print("chromium stdout:", file=sys.stderr)
+                        print(out.rstrip(), file=sys.stderr)
+                    print(f"cyview: viewer still available at {url} (input: {src_label})", file=sys.stderr)
+                    print("Press Ctrl+C to stop.", file=sys.stderr)
+                    try:
+                        while True:
+                            time.sleep(1)
+                    except KeyboardInterrupt:
+                        pass
+                else:
+                    # Normal: exit when chromium window closes (unless keep-alive).
+                    if args.keep_alive:
+                        print(f"cyview: serving {src_label} at {url} (Chromium PID {proc.pid})")
+                        try:
+                            proc.wait()
+                        except KeyboardInterrupt:
+                            pass
+                    else:
+                        try:
+                            proc.wait()
+                        finally:
+                            httpd.shutdown()
+                            httpd.server_close()
+                    return 0
+            finally:
+                shutil.rmtree(profile_dir, ignore_errors=True)
+
+        # xdg-open path (explicit or fallback)
+        subprocess.run(["xdg-open", url], check=False)
+        print(f"cyview: serving {src_label} at {url} (Ctrl+C to stop)")
+        try:
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+
+    return 0
+
+if __name__ == "__main__":
+    raise SystemExit(main())

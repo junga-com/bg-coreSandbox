@@ -1,0 +1,40 @@
+{
+  "elements": {
+    "nodes": [
+      {
+        "data": {
+          "id": "core",
+          "label": "core"
+        }
+      },
+      {
+        "data": {
+          "id": "utils",
+          "label": "utils"
+        }
+      },
+      {
+        "data": {
+          "id": "cli",
+          "label": "cli"
+        }
+      }
+    ],
+    "edges": [
+      {
+        "data": {
+          "id": "e1",
+          "source": "cli",
+          "target": "core"
+        }
+      },
+      {
+        "data": {
+          "id": "e2",
+          "source": "core",
+          "target": "utils"
+        }
+      }
+    ]
+  }
+}

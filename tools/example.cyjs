@@ -1,0 +1,11 @@
+{
+        "elements": {
+            "nodes": [
+                {"data": {"id": "a", "label": "a"}},
+                {"data": {"id": "b", "label": "b"}}
+            ],
+            "edges": [
+                {"data": {"id": "ab", "source": "a", "target": "b", "label": "imports"}}
+            ]
+        }
+}
