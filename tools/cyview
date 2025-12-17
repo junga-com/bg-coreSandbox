@@ -11,6 +11,7 @@ import threading
 import time
 from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
+from typing import Optional, Tuple
 
 HTML_TEMPLATE = """<!doctype html>
 <html>
@@ -75,65 +76,161 @@ HTML_TEMPLATE = """<!doctype html>
 </html>
 """
 
-class QuietHandler(SimpleHTTPRequestHandler):
-    # suppress routine GET logging
-    def log_message(self, format, *args):
-        return
+HELP_EPILOG = r"""
+Description:
+  cyview serves a Cytoscape.js JSON graph ("CYJS") and opens an interactive viewer.
 
-def pick_port() -> int:
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+Input format:
+  CYJS is JSON that contains (at minimum) an "elements" object with "nodes" and "edges".
+  This corresponds to Cytoscape.js elements JSON used by cytoscape({ elements: ... }).
+  You can provide CYJS via a .cyjs file or via stdin.
+
+Usage:
+  cyview path/to/graph.cyjs
+  cat graph.cyjs | cyview
+  cyview - < graph.cyjs
+
+Minimal example CYJS (copy/paste to test):
+  {
+    "elements": {
+      "nodes": [
+        { "data": { "id": "a", "label": "A" } },
+        { "data": { "id": "b", "label": "B" } }
+      ],
+      "edges": [
+        { "data": { "id": "ab", "source": "a", "target": "b", "label": "depends" } }
+      ]
+    }
+  }
+
+Try it:
+  printf '%s\n' '{ "elements": { "nodes": [ { "data": { "id": "a", "label": "A" } }, { "data": { "id": "b", "label": "B" } } ], "edges": [ { "data": { "id": "ab", "source": "a", "target": "b" } } ] } }' | cyview
+""".strip()
+
 
 def have_gui() -> bool:
     return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
 
-def find_chromium():
+
+def find_chromium() -> Optional[str]:
     for name in ("chromium", "chromium-browser", "google-chrome", "google-chrome-stable", "microsoft-edge"):
         path = shutil.which(name)
         if path:
             return path
     return None
 
+
 def read_cyjs_from_stdin() -> str:
     data = sys.stdin.read()
     if not data.strip():
         raise ValueError("No CYJS content received on stdin.")
-    # basic sanity: ensure it's JSON
     json.loads(data)
     return data
+
 
 def read_cyjs_from_file(path: Path) -> str:
     data = path.read_text(encoding="utf-8")
     json.loads(data)
     return data
 
-def write_session_files(session_dir: Path, cyjs_text: str, cyjs_filename: str = "graph.cyjs") -> Path:
-    cyjs_path = session_dir / cyjs_filename
-    cyjs_path.write_text(cyjs_text, encoding="utf-8")
+
+def write_session_files(session_dir: Path, cyjs_text: str, cyjs_filename: str) -> None:
+    (session_dir / cyjs_filename).write_text(cyjs_text, encoding="utf-8")
     (session_dir / "viewer.html").write_text(
         HTML_TEMPLATE.replace("__CYJS_FILE__", cyjs_filename),
         encoding="utf-8",
     )
-    return cyjs_path
 
-def run_server(docroot: Path, port: int):
+
+class OnceAwareHandler(SimpleHTTPRequestHandler):
+    """
+    Quiet handler:
+      - suppress normal request logs
+      - optionally signal "once" when viewer.html is successfully served
+    """
+    once_event: Optional[threading.Event] = None
+
+    def log_message(self, format, *args):
+        # suppress routine GET logging
+        return
+
+    def do_GET(self):
+        # Let SimpleHTTPRequestHandler do all the real work
+        super().do_GET()
+        # If requested /viewer.html and succeeded, signal once_event
+        if self.once_event and self.path.split("?", 1)[0] in ("/viewer.html", "viewer.html"):
+            # self.command/self.path are available; success indicated by 200
+            # SimpleHTTPRequestHandler sets self._headers_buffer; easiest stable check: self.send_response called.
+            # We'll use a best-effort: if viewer.html exists and path matches, signal.
+            self.once_event.set()
+
+
+def make_server(docroot: Path, bind: str, port: int, once_event: Optional[threading.Event]) -> ThreadingHTTPServer:
     os.chdir(docroot)
-    httpd = ThreadingHTTPServer(("127.0.0.1", port), QuietHandler)
+    OnceAwareHandler.once_event = once_event
+    httpd = ThreadingHTTPServer((bind, port), OnceAwareHandler)
     return httpd
 
-def main():
-    ap = argparse.ArgumentParser()
+
+def build_url(bind: str, port: int) -> str:
+    # For URLs, 0.0.0.0 is not meaningful; suggest localhost for user-facing URL.
+    host = bind
+    if bind in ("0.0.0.0", "::"):
+        host = "127.0.0.1"
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    return f"http://{host}:{port}/viewer.html"
+
+
+def emit_json_line(payload: dict) -> None:
+    sys.stdout.write(json.dumps(payload, separators=(",", ":"), ensure_ascii=False) + "\n")
+    sys.stdout.flush()
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        prog="cyview",
+        description="Serve and view Cytoscape.js JSON graphs (.cyjs).",
+        formatter_class=argparse.RawTextHelpFormatter,
+        epilog=HELP_EPILOG,
+    )
     ap.add_argument(
         "input",
         nargs="?",
         default=None,
         help="Path to .cyjs file, or '-' to read from stdin. If omitted, reads stdin when piped.",
     )
-    ap.add_argument("--ui", choices=["auto", "chromium", "xdg-open"], default="auto",
-                    help="UI launch mode. auto prefers chromium app mode if available, else xdg-open.")
-    ap.add_argument("--keep-alive", action="store_true",
-                    help="Don't auto-exit when chromium closes (debug).")
+    ap.add_argument(
+        "--ui",
+        choices=["auto", "chromium", "xdg-open", "print-url"],
+        default="auto",
+        help=(
+            "UI launch mode:\n"
+            "  auto      Prefer chromium app mode if available; else xdg-open\n"
+            "  chromium  Force chromium app mode\n"
+            "  xdg-open  Force default browser via xdg-open\n"
+            "  print-url Do not open anything; print viewer URL"
+        ),
+    )
+    ap.add_argument("--bind", default="127.0.0.1", help="Bind address for the local server (default: 127.0.0.1).")
+    ap.add_argument("--port", type=int, default=0, help="Port for the local server (default: 0 = auto).")
+    ap.add_argument(
+        "--once",
+        action="store_true",
+        help="Exit after the viewer page is first requested (best-effort).",
+    )
+    ap.add_argument(
+        "--emit",
+        choices=["json"],
+        default=None,
+        help="Emit machine-readable info to stdout (currently: --emit json).",
+    )
+    ap.add_argument(
+        "--keep-alive",
+        action="store_true",
+        help="Don't auto-exit when chromium closes (debug).",
+    )
+
     args = ap.parse_args()
 
     # Decide input source
@@ -144,51 +241,102 @@ def main():
         if from_stdin:
             cyjs_text = read_cyjs_from_stdin()
             src_label = "stdin"
+            cyjs_filename = "graph.cyjs"
         elif args.input:
             p = Path(args.input).expanduser().resolve()
             cyjs_text = read_cyjs_from_file(p)
             src_label = str(p)
+            cyjs_filename = p.name
+            if not cyjs_filename.lower().endswith(".cyjs"):
+                cyjs_filename += ".cyjs"
         else:
-            print("cyview: no input provided. Pass a .cyjs file, '-' for stdin, or pipe data into cyview.", file=sys.stderr)
+            print(
+                "cyview: no input provided. Pass a .cyjs file, '-' for stdin, or pipe data into cyview.",
+                file=sys.stderr,
+            )
             return 2
     except Exception as e:
-        print(f"cyview: failed to read/parse CYJS from {('stdin' if from_stdin else args.input)}: {e}", file=sys.stderr)
+        print(f"cyview: failed to read/parse CYJS: {e}", file=sys.stderr)
         return 2
 
     chromium = find_chromium()
-    prefer_chromium = (args.ui == "chromium") or (args.ui == "auto" and chromium is not None)
 
-    use_chromium = prefer_chromium and chromium is not None and have_gui()
-    if prefer_chromium and not have_gui():
-        # If user explicitly requested chromium, show why it won't work.
-        if args.ui == "chromium":
+    # Resolve UI selection
+    if args.ui == "chromium":
+        if not chromium:
+            print("cyview: --ui chromium requested but chromium/chrome not found in PATH.", file=sys.stderr)
+            return 3
+        if not have_gui():
             print("cyview: --ui chromium requested but no GUI detected (DISPLAY/WAYLAND_DISPLAY unset).", file=sys.stderr)
-            return 2
+            return 3
+        ui_selected = "chromium"
+    elif args.ui == "xdg-open":
+        ui_selected = "xdg-open"
+    elif args.ui == "print-url":
+        ui_selected = "print-url"
+    else:
+        # auto
+        if chromium and have_gui():
+            ui_selected = "chromium"
+        else:
+            ui_selected = "xdg-open"
 
-    # Create an isolated session directory for viewer assets (and for CYJS content too)
+    # Create isolated session dir (contains viewer.html + CYJS)
     with tempfile.TemporaryDirectory(prefix="cyview-session-") as td:
         session_dir = Path(td)
+        write_session_files(session_dir, cyjs_text, cyjs_filename)
 
-        # If input is a file, preserve its basename so it shows nicely in debugging.
-        if not from_stdin and args.input:
-            cyjs_filename = Path(args.input).name
-            if not cyjs_filename.lower().endswith(".cyjs"):
-                cyjs_filename = cyjs_filename + ".cyjs"
-        else:
-            cyjs_filename = "graph.cyjs"
+        once_event = threading.Event() if args.once else None
 
-        write_session_files(session_dir, cyjs_text, cyjs_filename=cyjs_filename)
+        try:
+            httpd = make_server(session_dir, args.bind, args.port, once_event)
+        except OSError as e:
+            print(f"cyview: failed to bind server on {args.bind}:{args.port}: {e}", file=sys.stderr)
+            return 2
 
-        port = pick_port()
-        httpd = run_server(session_dir, port)
-
+        # Start server
         server_thread = threading.Thread(target=httpd.serve_forever, daemon=True)
         server_thread.start()
 
-        url = f"http://127.0.0.1:{port}/viewer.html"
+        # Actual port (in case user passed --port 0)
+        actual_port = httpd.server_address[1]
+        url = build_url(args.bind, actual_port)
 
-        if use_chromium:
-            # Give chromium a unique profile to avoid "profile in use" immediate-exit.
+        # Emit machine-readable info if requested
+        chromium_pid = None
+        if args.emit == "json":
+            emit_json_line(
+                {
+                    "url": url,
+                    "bind": args.bind,
+                    "port": actual_port,
+                    "ui": ui_selected,
+                    "source": src_label,
+                }
+            )
+
+        # print-url mode: never open a browser
+        if ui_selected == "print-url":
+            if args.emit != "json":
+                # human-friendly one-liner
+                print(url, flush=True)
+
+            try:
+                if once_event:
+                    # wait until viewer first requested, then exit
+                    once_event.wait()
+                else:
+                    while True:
+                        time.sleep(1)
+            except KeyboardInterrupt:
+                pass
+            finally:
+                httpd.shutdown()
+                httpd.server_close()
+            return 0
+
+        # chromium mode: spawn app window and exit when it closes (unless keep-alive)
+        if ui_selected == "chromium":
             profile_dir = tempfile.mkdtemp(prefix="cyview-chromium-profile-")
             try:
                 proc = subprocess.Popen(
@@ -206,8 +354,14 @@ def main():
                     stderr=subprocess.PIPE,
                     text=True,
                 )
+                chromium_pid = proc.pid
 
-                # Detect "exits immediately" and show stderr.
+                # If we’re emitting json, we now know pid; re-emit pid to stderr (avoid breaking JSON consumers).
+                # (If you want pid in JSON too, say so and we’ll add --emit json-v2 or a structured object.)
+                if args.emit == "json":
+                    print(f"cyview: chromium pid {chromium_pid}", file=sys.stderr)
+
+                # Detect immediate exit; show stderr and keep server alive for manual opening.
                 time.sleep(0.6)
                 rc = proc.poll()
                 if rc is not None:
@@ -219,37 +373,56 @@ def main():
                     if out.strip():
                         print("chromium stdout:", file=sys.stderr)
                         print(out.rstrip(), file=sys.stderr)
-                    print(f"cyview: viewer still available at {url} (input: {src_label})", file=sys.stderr)
-                    print("Press Ctrl+C to stop.", file=sys.stderr)
+
+                    # Keep running so user can still open URL elsewhere
+                    if args.emit != "json":
+                        print(url, flush=True)
                     try:
-                        while True:
-                            time.sleep(1)
+                        if once_event:
+                            once_event.wait()
+                        else:
+                            while True:
+                                time.sleep(1)
                     except KeyboardInterrupt:
                         pass
                 else:
-                    # Normal: exit when chromium window closes (unless keep-alive).
                     if args.keep_alive:
-                        print(f"cyview: serving {src_label} at {url} (Chromium PID {proc.pid})")
-                        try:
+                        if args.emit != "json":
+                            print(f"cyview: serving {src_label} at {url} (Chromium PID {chromium_pid})")
+                        # Optionally honor --once in keep-alive mode: exit when once_event triggers OR chromium closes.
+                        if once_event:
+                            while True:
+                                if proc.poll() is not None or once_event.is_set():
+                                    break
+                                time.sleep(0.2)
+                        else:
                             proc.wait()
-                        except KeyboardInterrupt:
-                            pass
                     else:
-                        try:
+                        # Normal: exit on chromium close, but also honor --once if requested (whichever comes first).
+                        if once_event:
+                            while True:
+                                if proc.poll() is not None or once_event.is_set():
+                                    break
+                                time.sleep(0.2)
+                        else:
                             proc.wait()
-                        finally:
-                            httpd.shutdown()
-                            httpd.server_close()
-                    return 0
             finally:
                 shutil.rmtree(profile_dir, ignore_errors=True)
+                httpd.shutdown()
+                httpd.server_close()
+            return 0
 
-        # xdg-open path (explicit or fallback)
+        # xdg-open mode: launch default browser (cannot reliably detect close)
         subprocess.run(["xdg-open", url], check=False)
-        print(f"cyview: serving {src_label} at {url} (Ctrl+C to stop)")
+
         try:
-            while True:
-                time.sleep(1)
+            if args.emit != "json":
+                print(f"cyview: serving {src_label} at {url}", file=sys.stderr if args.once else sys.stdout)
+            if once_event:
+                once_event.wait()
+            else:
+                while True:
+                    time.sleep(1)
         except KeyboardInterrupt:
             pass
         finally:
@@ -257,6 +430,7 @@ def main():
             httpd.server_close()
 
     return 0
+
 
 if __name__ == "__main__":
     raise SystemExit(main())
