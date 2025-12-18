@@ -11,7 +11,77 @@ import threading
 import time
 from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
+
+# ----------------------------
+# Default Cytoscape.js styles
+# ----------------------------
+
+DEFAULT_STYLES: List[Dict[str, Any]] = [
+    {
+        "selector": "node",
+        "style": {
+            "label": "data(label)",
+            "text-wrap": "wrap",
+            "text-max-width": 180,
+            "text-valign": "center",
+            "text-halign": "center",
+            "font-size": 12,
+
+            "background-color": "#4f7cff",
+            "shape": "roundrectangle",
+            "padding": "10px",
+
+            # Keep labels readable even when they exceed node bounds
+            "color": "#111",
+            "text-background-color": "#ffffff",
+            "text-background-opacity": 0.95,
+            "text-background-padding": "4px",
+            "text-background-shape": "roundrectangle",
+        },
+    },
+    {
+        "selector": "node:parent",
+        "style": {
+            "background-color": "#e9eefc",
+            "border-width": 2,
+            "border-color": "#4f7cff",
+            "padding": "18px",
+        },
+    },
+    {
+        "selector": "edge",
+        "style": {
+            "label": "data(label)",
+            "font-size": 10,
+            "text-rotation": "autorotate",
+            "text-wrap": "wrap",
+            "text-max-width": 180,
+
+            "curve-style": "bezier",
+            "target-arrow-shape": "triangle",
+            "line-color": "#999",
+            "target-arrow-color": "#999",
+            "width": 2,
+
+            # Edge-label readability
+            "color": "#111",
+            "text-background-color": "#ffffff",
+            "text-background-opacity": 0.85,
+            "text-background-padding": "2px",
+            "text-background-shape": "roundrectangle",
+        },
+    },
+    {
+        "selector": ":selected",
+        "style": {
+            "border-width": 3,
+            "border-color": "#ffb703",
+            "line-color": "#ffb703",
+            "target-arrow-color": "#ffb703",
+        },
+    },
+]
 
 HTML_TEMPLATE = """<!doctype html>
 <html>
@@ -21,7 +91,7 @@ HTML_TEMPLATE = """<!doctype html>
   <script src="https://unpkg.com/cytoscape@3.25.0/dist/cytoscape.min.js"></script>
   <style>
     html, body, #cy { width: 100%; height: 100%; margin: 0; }
-    #info {
+    #info {{
       position: fixed;
       top: 8px;
       left: 8px;
@@ -31,8 +101,11 @@ HTML_TEMPLATE = """<!doctype html>
       font-family: sans-serif;
       font-size: 13px;
       max-width: 45vw;
+      max-height: 45vh;
+      overflow: auto;
       white-space: pre;
-    }
+      box-shadow: 0 2px 10px rgba(0,0,0,0.12);
+    }}
   </style>
 </head>
 <body>
@@ -40,35 +113,24 @@ HTML_TEMPLATE = """<!doctype html>
   <div id="info">Click a node or edge…</div>
 
   <script>
-    async function main() {
+    async function main() {{
       const res = await fetch("__CYJS_FILE__");
       const cyjs = await res.json();
 
-      const cy = cytoscape({
+      const styles = __CYVIEW_STYLES__;
+
+      const cy = cytoscape({{
         container: document.getElementById("cy"),
         elements: cyjs.elements,
-        layout: { name: "cose" },
-        style: [
-          { selector: "node", style: {
-              "label": "data(label)",
-              "text-valign": "center",
-              "background-color": "#4f7cff",
-              "color": "#fff"
-          }},
-          { selector: "edge", style: {
-              "curve-style": "bezier",
-              "target-arrow-shape": "triangle",
-              "line-color": "#999",
-              "target-arrow-color": "#999"
-          }}
-        ]
-      });
+        style: styles,
+        layout: {{ name: "cose" }}
+      }});
 
       const info = document.getElementById("info");
-      cy.on("tap", "node,edge", e => {
+      cy.on("tap", "node,edge", e => {{
         info.textContent = JSON.stringify(e.target.data(), null, 2);
-      });
-    }
+      }});
+    }}
 
     main();
   </script>
@@ -76,37 +138,10 @@ HTML_TEMPLATE = """<!doctype html>
 </html>
 """
 
-HELP_EPILOG = r"""
-Description:
-  cyview serves a Cytoscape.js JSON graph ("CYJS") and opens an interactive viewer.
 
-Input format:
-  CYJS is JSON that contains (at minimum) an "elements" object with "nodes" and "edges".
-  This corresponds to Cytoscape.js elements JSON used by cytoscape({ elements: ... }).
-  You can provide CYJS via a .cyjs file or via stdin.
-
-Usage:
-  cyview path/to/graph.cyjs
-  cat graph.cyjs | cyview
-  cyview - < graph.cyjs
-
-Minimal example CYJS (copy/paste to test):
-  {
-    "elements": {
-      "nodes": [
-        { "data": { "id": "a", "label": "A" } },
-        { "data": { "id": "b", "label": "B" } }
-      ],
-      "edges": [
-        { "data": { "id": "ab", "source": "a", "target": "b", "label": "depends" } }
-      ]
-    }
-  }
-
-Try it:
-  printf '%s\n' '{ "elements": { "nodes": [ { "data": { "id": "a", "label": "A" } }, { "data": { "id": "b", "label": "B" } } ], "edges": [ { "data": { "id": "ab", "source": "a", "target": "b" } } ] } }' | cyview
-""".strip()
-
+# ----------------------------
+# Helpers
+# ----------------------------
 
 def have_gui() -> bool:
     return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
@@ -120,56 +155,10 @@ def find_chromium() -> Optional[str]:
     return None
 
 
-def read_cyjs_from_stdin() -> str:
-    data = sys.stdin.read()
-    if not data.strip():
-        raise ValueError("No CYJS content received on stdin.")
-    json.loads(data)
-    return data
-
-
-def read_cyjs_from_file(path: Path) -> str:
-    data = path.read_text(encoding="utf-8")
-    json.loads(data)
-    return data
-
-
-def write_session_files(session_dir: Path, cyjs_text: str, cyjs_filename: str) -> None:
-    (session_dir / cyjs_filename).write_text(cyjs_text, encoding="utf-8")
-    (session_dir / "viewer.html").write_text(
-        HTML_TEMPLATE.replace("__CYJS_FILE__", cyjs_filename),
-        encoding="utf-8",
-    )
-
-
-class OnceAwareHandler(SimpleHTTPRequestHandler):
-    """
-    Quiet handler:
-      - suppress normal request logs
-      - optionally signal "once" when viewer.html is successfully served
-    """
-    once_event: Optional[threading.Event] = None
-
-    def log_message(self, format, *args):
-        # suppress routine GET logging
-        return
-
-    def do_GET(self):
-        # Let SimpleHTTPRequestHandler do all the real work
-        super().do_GET()
-        # If requested /viewer.html and succeeded, signal once_event
-        if self.once_event and self.path.split("?", 1)[0] in ("/viewer.html", "viewer.html"):
-            # self.command/self.path are available; success indicated by 200
-            # SimpleHTTPRequestHandler sets self._headers_buffer; easiest stable check: self.send_response called.
-            # We'll use a best-effort: if viewer.html exists and path matches, signal.
-            self.once_event.set()
-
-
-def make_server(docroot: Path, bind: str, port: int, once_event: Optional[threading.Event]) -> ThreadingHTTPServer:
-    os.chdir(docroot)
-    OnceAwareHandler.once_event = once_event
-    httpd = ThreadingHTTPServer((bind, port), OnceAwareHandler)
-    return httpd
+def pick_port(bind: str) -> int:
+    with socket.socket() as s:
+        s.bind((bind, 0))
+        return s.getsockname()[1]
 
 
 def build_url(bind: str, port: int) -> str:
@@ -187,12 +176,162 @@ def emit_json_line(payload: dict) -> None:
     sys.stdout.flush()
 
 
+def read_cyjs_from_stdin() -> str:
+    data = sys.stdin.read()
+    if not data.strip():
+        raise ValueError("No CYJS content received on stdin.")
+    json.loads(data)  # validate
+    return data
+
+
+def read_cyjs_from_file(path: Path) -> str:
+    data = path.read_text(encoding="utf-8")
+    json.loads(data)  # validate
+    return data
+
+
+def parse_styles_json(text: str, src_path: Path) -> List[Dict[str, Any]]:
+    """
+    Accept either:
+      - a JSON array of selector blocks, or
+      - a JSON object containing {"style": [ ... ]} or {"styles": [ ... ]}.
+    """
+    obj = json.loads(text)
+    if isinstance(obj, list):
+        return obj
+    if isinstance(obj, dict):
+        for key in ("style", "styles"):
+            v = obj.get(key)
+            if isinstance(v, list):
+                return v
+    raise ValueError(f"Expected a JSON array, or an object with 'style'/'styles' array in {src_path}")
+
+
+def load_style_file(path: Path) -> Tuple[bool, List[Dict[str, Any]]]:
+    """
+    Returns (replace, styles_to_append).
+    Replace is true when first line is '# replace' (forgiving of leading whitespace).
+    """
+    raw = path.read_text(encoding="utf-8")
+    lines = raw.splitlines(True)  # keep line endings
+    if not lines:
+        return (False, [])
+
+    first = lines[0].lstrip()
+    replace = first.startswith("# replace")
+
+    if replace:
+        rest = "".join(lines[1:]).strip()
+        if not rest:
+            return (True, [])  # explicitly no styles
+        styles = parse_styles_json(rest, path)
+        return (True, styles)
+
+    # normal append mode
+    if not raw.strip():
+        return (False, [])
+    styles = parse_styles_json(raw, path)
+    return (False, styles)
+
+
+def build_styles_collection(
+    cyjs_source_file: Optional[Path],
+    pwd: Path
+) -> List[Dict[str, Any]]:
+    """
+    Styles resolution order (later appends win):
+      1) hard-coded defaults
+      2) /etc/cyview/cyview.styles
+      3) ~/.config/cyview/cyview.styles
+      4) <cyjs file dir>/cyview.styles   (if input file provided)
+      5) <PWD>/cyview.styles             (if different from cyjs dir, still applied last)
+    If a styles file starts with '# replace' (leading whitespace ok), the running list is cleared.
+    """
+    styles: List[Dict[str, Any]] = list(DEFAULT_STYLES)
+
+    folders: List[Path] = [
+        Path("/etc/cyview"),
+        Path.home() / ".config" / "cyview",
+    ]
+
+    if cyjs_source_file is not None:
+        folders.append(cyjs_source_file.parent)
+
+    folders.append(pwd)
+
+    seen = set()
+    for folder in folders:
+        try:
+            folder = folder.resolve()
+        except Exception:
+            pass
+        key = str(folder)
+        # Allow duplicates but avoid doing the same dir twice in a row/overall
+        if key in seen:
+            continue
+        seen.add(key)
+
+        sp = folder / "cyview.styles"
+        if not sp.exists():
+            continue
+        if not sp.is_file():
+            continue
+
+        try:
+            replace, add_styles = load_style_file(sp)
+            if replace:
+                styles = []
+            styles.extend(add_styles)
+        except Exception as e:
+            print(f"cyview: warning: ignoring invalid styles file {sp}: {e}", file=sys.stderr)
+
+    return styles
+
+
+# ----------------------------
+# HTTP Handler with --once support
+# ----------------------------
+
+class OnceAwareHandler(SimpleHTTPRequestHandler):
+    """
+    Quiet handler:
+      - suppress normal request logs
+      - optionally signal "once" when viewer.html is successfully served (best-effort)
+    """
+    once_event: Optional[threading.Event] = None
+
+    def log_message(self, format, *args):
+        return
+
+    def send_head(self):
+        # Determine if request is for viewer.html (with or without leading /)
+        path_no_q = self.path.split("?", 1)[0]
+        is_viewer = path_no_q in ("/viewer.html", "viewer.html")
+
+        f = super().send_head()
+
+        # If we are actually serving viewer.html (file opened), signal once_event
+        if is_viewer and f is not None and self.once_event is not None:
+            self.once_event.set()
+
+        return f
+
+
+def make_server(docroot: Path, bind: str, port: int, once_event: Optional[threading.Event]) -> ThreadingHTTPServer:
+    os.chdir(docroot)
+    OnceAwareHandler.once_event = once_event
+    return ThreadingHTTPServer((bind, port), OnceAwareHandler)
+
+
+# ----------------------------
+# Main
+# ----------------------------
+
 def main() -> int:
     ap = argparse.ArgumentParser(
         prog="cyview",
         description="Serve and view Cytoscape.js JSON graphs (.cyjs).",
-        formatter_class=argparse.RawTextHelpFormatter,
-        epilog=HELP_EPILOG,
+        epilog="See `man cyview` for full documentation (including cyview.styles).",
     )
     ap.add_argument(
         "input",
@@ -204,32 +343,13 @@ def main() -> int:
         "--ui",
         choices=["auto", "chromium", "xdg-open", "print-url"],
         default="auto",
-        help=(
-            "UI launch mode:\n"
-            "  auto      Prefer chromium app mode if available; else xdg-open\n"
-            "  chromium  Force chromium app mode\n"
-            "  xdg-open  Force default browser via xdg-open\n"
-            "  print-url Do not open anything; print viewer URL"
-        ),
+        help="UI mode: auto|chromium|xdg-open|print-url",
     )
-    ap.add_argument("--bind", default="127.0.0.1", help="Bind address for the local server (default: 127.0.0.1).")
-    ap.add_argument("--port", type=int, default=0, help="Port for the local server (default: 0 = auto).")
-    ap.add_argument(
-        "--once",
-        action="store_true",
-        help="Exit after the viewer page is first requested (best-effort).",
-    )
-    ap.add_argument(
-        "--emit",
-        choices=["json"],
-        default=None,
-        help="Emit machine-readable info to stdout (currently: --emit json).",
-    )
-    ap.add_argument(
-        "--keep-alive",
-        action="store_true",
-        help="Don't auto-exit when chromium closes (debug).",
-    )
+    ap.add_argument("--bind", default="127.0.0.1", help="Bind address (default: 127.0.0.1).")
+    ap.add_argument("--port", type=int, default=0, help="Port (default: 0 = auto).")
+    ap.add_argument("--once", action="store_true", help="Exit after viewer page is first served (best-effort).")
+    ap.add_argument("--emit", choices=["json"], default=None, help="Emit machine-readable info (currently: json).")
+    ap.add_argument("--keep-alive", action="store_true", help="Don't auto-exit when chromium closes (debug).")
 
     args = ap.parse_args()
 
@@ -237,23 +357,21 @@ def main() -> int:
     piped = not sys.stdin.isatty()
     from_stdin = (args.input == "-") or (args.input is None and piped)
 
+    cyjs_source_file: Optional[Path] = None
     try:
         if from_stdin:
             cyjs_text = read_cyjs_from_stdin()
             src_label = "stdin"
             cyjs_filename = "graph.cyjs"
         elif args.input:
-            p = Path(args.input).expanduser().resolve()
-            cyjs_text = read_cyjs_from_file(p)
-            src_label = str(p)
-            cyjs_filename = p.name
+            cyjs_source_file = Path(args.input).expanduser().resolve()
+            cyjs_text = read_cyjs_from_file(cyjs_source_file)
+            src_label = str(cyjs_source_file)
+            cyjs_filename = cyjs_source_file.name
             if not cyjs_filename.lower().endswith(".cyjs"):
                 cyjs_filename += ".cyjs"
         else:
-            print(
-                "cyview: no input provided. Pass a .cyjs file, '-' for stdin, or pipe data into cyview.",
-                file=sys.stderr,
-            )
+            print("cyview: no input provided. Pass a .cyjs file, '-' for stdin, or pipe data into cyview.", file=sys.stderr)
             return 2
     except Exception as e:
         print(f"cyview: failed to read/parse CYJS: {e}", file=sys.stderr)
@@ -281,10 +399,23 @@ def main() -> int:
         else:
             ui_selected = "xdg-open"
 
+    pwd = Path.cwd()
+    styles = build_styles_collection(cyjs_source_file=cyjs_source_file, pwd=pwd)
+
     # Create isolated session dir (contains viewer.html + CYJS)
     with tempfile.TemporaryDirectory(prefix="cyview-session-") as td:
         session_dir = Path(td)
-        write_session_files(session_dir, cyjs_text, cyjs_filename)
+
+        # Write CYJS and viewer
+        (session_dir / cyjs_filename).write_text(cyjs_text, encoding="utf-8")
+        styles_json = json.dumps(styles, ensure_ascii=False)
+
+        html = (
+            HTML_TEMPLATE
+            .replace("__CYJS_FILE__", cyjs_filename)
+            .replace("__CYVIEW_STYLES__", styles_json)
+        )
+        (session_dir / "viewer.html").write_text(html, encoding="utf-8")
 
         once_event = threading.Event() if args.once else None
 
@@ -294,36 +425,21 @@ def main() -> int:
             print(f"cyview: failed to bind server on {args.bind}:{args.port}: {e}", file=sys.stderr)
             return 2
 
-        # Start server
         server_thread = threading.Thread(target=httpd.serve_forever, daemon=True)
         server_thread.start()
 
-        # Actual port (in case user passed --port 0)
         actual_port = httpd.server_address[1]
         url = build_url(args.bind, actual_port)
 
-        # Emit machine-readable info if requested
-        chromium_pid = None
         if args.emit == "json":
-            emit_json_line(
-                {
-                    "url": url,
-                    "bind": args.bind,
-                    "port": actual_port,
-                    "ui": ui_selected,
-                    "source": src_label,
-                }
-            )
+            emit_json_line({"url": url, "bind": args.bind, "port": actual_port, "ui": ui_selected, "source": src_label})
 
         # print-url mode: never open a browser
         if ui_selected == "print-url":
             if args.emit != "json":
-                # human-friendly one-liner
                 print(url, flush=True)
-
             try:
                 if once_event:
-                    # wait until viewer first requested, then exit
                     once_event.wait()
                 else:
                     while True:
@@ -335,8 +451,8 @@ def main() -> int:
                 httpd.server_close()
             return 0
 
-        # chromium mode: spawn app window and exit when it closes (unless keep-alive)
-        if ui_selected == "chromium":
+        # chromium mode
+        if ui_selected == "chromium" and chromium:
             profile_dir = tempfile.mkdtemp(prefix="cyview-chromium-profile-")
             try:
                 proc = subprocess.Popen(
@@ -354,12 +470,6 @@ def main() -> int:
                     stderr=subprocess.PIPE,
                     text=True,
                 )
-                chromium_pid = proc.pid
-
-                # If we’re emitting json, we now know pid; re-emit pid to stderr (avoid breaking JSON consumers).
-                # (If you want pid in JSON too, say so and we’ll add --emit json-v2 or a structured object.)
-                if args.emit == "json":
-                    print(f"cyview: chromium pid {chromium_pid}", file=sys.stderr)
 
                 # Detect immediate exit; show stderr and keep server alive for manual opening.
                 time.sleep(0.6)
@@ -374,7 +484,6 @@ def main() -> int:
                         print("chromium stdout:", file=sys.stderr)
                         print(out.rstrip(), file=sys.stderr)
 
-                    # Keep running so user can still open URL elsewhere
                     if args.emit != "json":
                         print(url, flush=True)
                     try:
@@ -386,10 +495,10 @@ def main() -> int:
                     except KeyboardInterrupt:
                         pass
                 else:
+                    # Exit on chromium close, but honor --once if requested (whichever comes first)
                     if args.keep_alive:
                         if args.emit != "json":
-                            print(f"cyview: serving {src_label} at {url} (Chromium PID {chromium_pid})")
-                        # Optionally honor --once in keep-alive mode: exit when once_event triggers OR chromium closes.
+                            print(f"cyview: serving {src_label} at {url} (Chromium PID {proc.pid})")
                         if once_event:
                             while True:
                                 if proc.poll() is not None or once_event.is_set():
@@ -398,7 +507,6 @@ def main() -> int:
                         else:
                             proc.wait()
                     else:
-                        # Normal: exit on chromium close, but also honor --once if requested (whichever comes first).
                         if once_event:
                             while True:
                                 if proc.poll() is not None or once_event.is_set():
@@ -412,12 +520,10 @@ def main() -> int:
                 httpd.server_close()
             return 0
 
-        # xdg-open mode: launch default browser (cannot reliably detect close)
+        # xdg-open mode
         subprocess.run(["xdg-open", url], check=False)
 
         try:
-            if args.emit != "json":
-                print(f"cyview: serving {src_label} at {url}", file=sys.stderr if args.once else sys.stdout)
             if once_event:
                 once_event.wait()
             else:
