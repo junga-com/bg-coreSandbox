@@ -11,7 +11,7 @@ import threading
 import time
 from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple
 
 # ----------------------------
 # Default Cytoscape.js styles
@@ -32,7 +32,6 @@ DEFAULT_STYLES: List[Dict[str, Any]] = [
             "shape": "roundrectangle",
             "padding": "10px",
 
-            # Keep labels readable even when they exceed node bounds
             "color": "#111",
             "text-background-color": "#ffffff",
             "text-background-opacity": 0.95,
@@ -64,7 +63,6 @@ DEFAULT_STYLES: List[Dict[str, Any]] = [
             "target-arrow-color": "#999",
             "width": 2,
 
-            # Edge-label readability
             "color": "#111",
             "text-background-color": "#ffffff",
             "text-background-opacity": 0.85,
@@ -155,14 +153,7 @@ def find_chromium() -> Optional[str]:
     return None
 
 
-def pick_port(bind: str) -> int:
-    with socket.socket() as s:
-        s.bind((bind, 0))
-        return s.getsockname()[1]
-
-
 def build_url(bind: str, port: int) -> str:
-    # For URLs, 0.0.0.0 is not meaningful; suggest localhost for user-facing URL.
     host = bind
     if bind in ("0.0.0.0", "::"):
         host = "127.0.0.1"
@@ -180,13 +171,13 @@ def read_cyjs_from_stdin() -> str:
     data = sys.stdin.read()
     if not data.strip():
         raise ValueError("No CYJS content received on stdin.")
-    json.loads(data)  # validate
+    json.loads(data)
     return data
 
 
 def read_cyjs_from_file(path: Path) -> str:
     data = path.read_text(encoding="utf-8")
-    json.loads(data)  # validate
+    json.loads(data)
     return data
 
 
@@ -213,7 +204,7 @@ def load_style_file(path: Path) -> Tuple[bool, List[Dict[str, Any]]]:
     Replace is true when first line is '# replace' (forgiving of leading whitespace).
     """
     raw = path.read_text(encoding="utf-8")
-    lines = raw.splitlines(True)  # keep line endings
+    lines = raw.splitlines(True)
     if not lines:
         return (False, [])
 
@@ -224,39 +215,63 @@ def load_style_file(path: Path) -> Tuple[bool, List[Dict[str, Any]]]:
         rest = "".join(lines[1:]).strip()
         if not rest:
             return (True, [])  # explicitly no styles
-        styles = parse_styles_json(rest, path)
-        return (True, styles)
+        return (True, parse_styles_json(rest, path))
 
-    # normal append mode
     if not raw.strip():
         return (False, [])
-    styles = parse_styles_json(raw, path)
-    return (False, styles)
+    return (False, parse_styles_json(raw, path))
+
+
+def scheme_to_filename(scheme: str) -> str:
+    """
+    'default' -> 'cyview.styles'
+    other     -> 'cyview.styles.<scheme>'
+    """
+    s = scheme.strip()
+    if not s or s == "default":
+        return "cyview.styles"
+    return f"cyview.styles.{s}"
+
+
+def resolve_styles_scheme(cli_value: Optional[str]) -> str:
+    """
+    Precedence:
+      1) --styles NAME (if provided)
+      2) CYVIEW_STYLES env var (if set and non-empty)
+      3) default
+    """
+    if cli_value is not None:
+        return cli_value.strip() or "default"
+    env = os.environ.get("CYVIEW_STYLES", "").strip()
+    return env or "default"
 
 
 def build_styles_collection(
     cyjs_source_file: Optional[Path],
-    pwd: Path
+    pwd: Path,
+    scheme: str
 ) -> List[Dict[str, Any]]:
     """
     Styles resolution order (later appends win):
       1) hard-coded defaults
-      2) /etc/cyview/cyview.styles
-      3) ~/.config/cyview/cyview.styles
-      4) <cyjs file dir>/cyview.styles   (if input file provided)
-      5) <PWD>/cyview.styles             (if different from cyjs dir, still applied last)
+      2) /etc/cyview/<stylesfile>
+      3) ~/.config/cyview/<stylesfile>
+      4) <cyjs file dir>/<stylesfile>   (if input is a file)
+      5) <PWD>/<stylesfile>
+    Where <stylesfile> is:
+      - cyview.styles                 when scheme=default
+      - cyview.styles.<schemeName>    otherwise
     If a styles file starts with '# replace' (leading whitespace ok), the running list is cleared.
     """
     styles: List[Dict[str, Any]] = list(DEFAULT_STYLES)
+    stylesfile = scheme_to_filename(scheme)
 
     folders: List[Path] = [
         Path("/etc/cyview"),
         Path.home() / ".config" / "cyview",
     ]
-
     if cyjs_source_file is not None:
         folders.append(cyjs_source_file.parent)
-
     folders.append(pwd)
 
     seen = set()
@@ -266,15 +281,12 @@ def build_styles_collection(
         except Exception:
             pass
         key = str(folder)
-        # Allow duplicates but avoid doing the same dir twice in a row/overall
         if key in seen:
             continue
         seen.add(key)
 
-        sp = folder / "cyview.styles"
-        if not sp.exists():
-            continue
-        if not sp.is_file():
+        sp = folder / stylesfile
+        if not sp.exists() or not sp.is_file():
             continue
 
         try:
@@ -293,27 +305,17 @@ def build_styles_collection(
 # ----------------------------
 
 class OnceAwareHandler(SimpleHTTPRequestHandler):
-    """
-    Quiet handler:
-      - suppress normal request logs
-      - optionally signal "once" when viewer.html is successfully served (best-effort)
-    """
     once_event: Optional[threading.Event] = None
 
     def log_message(self, format, *args):
         return
 
     def send_head(self):
-        # Determine if request is for viewer.html (with or without leading /)
         path_no_q = self.path.split("?", 1)[0]
         is_viewer = path_no_q in ("/viewer.html", "viewer.html")
-
         f = super().send_head()
-
-        # If we are actually serving viewer.html (file opened), signal once_event
         if is_viewer and f is not None and self.once_event is not None:
             self.once_event.set()
-
         return f
 
 
@@ -345,6 +347,12 @@ def main() -> int:
         default="auto",
         help="UI mode: auto|chromium|xdg-open|print-url",
     )
+    ap.add_argument(
+        "--styles",
+        default=None,
+        metavar="NAME",
+        help="Style scheme name (default: 'default'). Also configurable via $CYVIEW_STYLES.",
+    )
     ap.add_argument("--bind", default="127.0.0.1", help="Bind address (default: 127.0.0.1).")
     ap.add_argument("--port", type=int, default=0, help="Port (default: 0 = auto).")
     ap.add_argument("--once", action="store_true", help="Exit after viewer page is first served (best-effort).")
@@ -352,6 +360,8 @@ def main() -> int:
     ap.add_argument("--keep-alive", action="store_true", help="Don't auto-exit when chromium closes (debug).")
 
     args = ap.parse_args()
+
+    scheme = resolve_styles_scheme(args.styles)
 
     # Decide input source
     piped = not sys.stdin.isatty()
@@ -393,20 +403,14 @@ def main() -> int:
     elif args.ui == "print-url":
         ui_selected = "print-url"
     else:
-        # auto
-        if chromium and have_gui():
-            ui_selected = "chromium"
-        else:
-            ui_selected = "xdg-open"
+        ui_selected = "chromium" if (chromium and have_gui()) else "xdg-open"
 
     pwd = Path.cwd()
-    styles = build_styles_collection(cyjs_source_file=cyjs_source_file, pwd=pwd)
+    styles = build_styles_collection(cyjs_source_file=cyjs_source_file, pwd=pwd, scheme=scheme)
 
-    # Create isolated session dir (contains viewer.html + CYJS)
     with tempfile.TemporaryDirectory(prefix="cyview-session-") as td:
         session_dir = Path(td)
 
-        # Write CYJS and viewer
         (session_dir / cyjs_filename).write_text(cyjs_text, encoding="utf-8")
         styles_json = json.dumps(styles, ensure_ascii=False)
 
@@ -432,9 +436,16 @@ def main() -> int:
         url = build_url(args.bind, actual_port)
 
         if args.emit == "json":
-            emit_json_line({"url": url, "bind": args.bind, "port": actual_port, "ui": ui_selected, "source": src_label})
+            emit_json_line({
+                "url": url,
+                "bind": args.bind,
+                "port": actual_port,
+                "ui": ui_selected,
+                "source": src_label,
+                "styles": scheme,
+            })
 
-        # print-url mode: never open a browser
+        # print-url mode
         if ui_selected == "print-url":
             if args.emit != "json":
                 print(url, flush=True)
@@ -471,7 +482,6 @@ def main() -> int:
                     text=True,
                 )
 
-                # Detect immediate exit; show stderr and keep server alive for manual opening.
                 time.sleep(0.6)
                 rc = proc.poll()
                 if rc is not None:
@@ -495,7 +505,6 @@ def main() -> int:
                     except KeyboardInterrupt:
                         pass
                 else:
-                    # Exit on chromium close, but honor --once if requested (whichever comes first)
                     if args.keep_alive:
                         if args.emit != "json":
                             print(f"cyview: serving {src_label} at {url} (Chromium PID {proc.pid})")
@@ -522,7 +531,6 @@ def main() -> int:
 
         # xdg-open mode
         subprocess.run(["xdg-open", url], check=False)
-
         try:
             if once_event:
                 once_event.wait()
