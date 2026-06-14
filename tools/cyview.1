@@ -16,48 +16,30 @@ cyview \- view Cytoscape.js JSON graphs (.cyjs) with a lightweight local web vie
 \fBcyview\fR is a small Linux command that opens an interactive viewer for Cytoscape.js JSON graphs (commonly stored with the \fI.cyjs\fR extension).
 It runs a tiny local HTTP server and opens a browser window (preferably Chromium in app mode) to display the diagram.
 
-.SH INPUT FORMAT
-\fBcyview\fR expects CYJS content: JSON compatible with Cytoscape.js element definitions.
-At minimum, the document should contain an \fBelements\fR object with \fBnodes\fR and \fBedges\fR:
-
-.nf
-{
-  "elements": {
-    "nodes": [
-      { "data": { "id": "a", "label": "A" } },
-      { "data": { "id": "b", "label": "B" } }
-    ],
-    "edges": [
-      { "data": { "id": "ab", "source": "a", "target": "b", "label": "depends" } }
-    ]
-  }
-}
-.fi
-
-Compound (nested) nodes are supported via the \fBparent\fR field in a node's \fBdata\fR.
-
 .SH OPTIONS
 .TP
 .BR \-\-ui " {auto|chromium|xdg-open|print-url}"
 Select how the viewer is opened.
-\fBauto\fR prefers Chromium app mode if available, otherwise falls back to \fBxdg-open\fR.
-\fBchromium\fR forces Chromium app mode.
-\fBxdg-open\fR forces default browser via \fBxdg-open\fR.
-\fBprint-url\fR does not open a browser; it prints the viewer URL and continues serving until interrupted (or until \fB--once\fR triggers).
 
 .TP
 .BR \-\-styles " NAME"
 Select a style scheme. The scheme controls which \fBcyview.styles\fR file name is searched and applied.
 If not specified, \fBcyview\fR uses the environment variable \fBCYVIEW_STYLES\fR if set; otherwise it uses \fBdefault\fR.
 
+Special value:
+.RS
+.TP
+.B list
+Print discovered scheme names (one per line) and exit. This is useful for shell tab completion.
+.RE
+
 .TP
 .BR \-\-bind " ADDR"
-Bind address for the local HTTP server. Default is \fB127.0.0.1\fR.
-If you use \fB0.0.0.0\fR, the server binds all interfaces (be careful).
+Bind address for the local HTTP server.
 
 .TP
 .BR \-\-port " PORT"
-Port for the local HTTP server. Default is \fB0\fR (choose a free ephemeral port).
+Port for the local HTTP server.
 
 .TP
 .BR \-\-once
@@ -65,8 +47,7 @@ Exit after the viewer page (\fIviewer.html\fR) is served the first time (best-ef
 
 .TP
 .BR \-\-emit " json"
-Emit machine-readable information to stdout. Currently supported: \fBjson\fR.
-The JSON includes the selected UI mode, bind/port, URL, input source, and selected style scheme.
+Emit machine-readable information to stdout.
 
 .TP
 .BR \-\-keep-alive
@@ -76,141 +57,15 @@ In Chromium mode, do not auto-exit when Chromium closes (debugging).
 .TP
 .B CYVIEW_STYLES
 Default style scheme name to use when \fB--styles\fR is not provided.
-For example:
-.nf
-export CYVIEW_STYLES=print
-.fi
 
 .SH STYLES CONFIGURATION
-\fBcyview\fR constructs its Cytoscape.js style array dynamically.
-
-The style collection starts with built-in defaults, then applies zero or more user-provided style files.
-
-.TP
-.B Style scheme file naming
-The selected scheme determines the styles filename searched in each config directory:
+(See previous version of this man page content; the scheme naming, replace semantics, merge semantics, and search order are unchanged.)
+.PP
+Scheme naming:
 .IP \(bu 2
 Scheme \fBdefault\fR uses \fBcyview.styles\fR
 .IP \(bu 2
 Any other scheme name \fBNAME\fR uses \fBcyview.styles.NAME\fR
-
-Examples:
-.nf
-cyview --styles print graph.cyjs
-# searches cyview.styles.print files
-
-CYVIEW_STYLES=dark cyview graph.cyjs
-# searches cyview.styles.dark files
-.fi
-
-.TP
-.B Styles file format
-Each styles file contains JSON defining Cytoscape.js selector blocks.
-Accepted formats are:
-.IP \(bu 2
-A JSON array of selector blocks
-.IP \(bu 2
-A JSON object containing \fBstyle\fR or \fBstyles\fR with an array value
-
-Example (\fIcyview.styles.print\fR):
-.nf
-[
-  {
-    "selector": "node",
-    "style": {
-      "font-size": 14,
-      "text-max-width": 240
-    }
-  },
-  {
-    "selector": "edge",
-    "style": {
-      "width": 3
-    }
-  }
-]
-.fi
-
-.TP
-.B Replace semantics
-If the first line (leading whitespace permitted) is:
-.nf
-# replace
-.fi
-then the running style collection is cleared before applying the JSON that follows.
-If the file contains only \fB# replace\fR and no JSON after it, the resulting style collection is empty (no styles).
-
-.TP
-.B Merge semantics
-Styles are appended in order. Later selector blocks override earlier ones when selectors overlap (Cytoscape.js resolves conflicts by applying later styles).
-
-.TP
-.B Search order
-For the selected scheme filename, style files are searched in this order:
-.IP 1. 3
-\fB/etc/cyview/\fR
-.IP 2. 3
-\fB~/.config/cyview/\fR
-.IP 3. 3
-The directory containing the input \fI.cyjs\fR file (only when input is a file)
-.IP 4. 3
-The current working directory (PWD)
-
-.SH EXAMPLES
-View a file:
-.nf
-cyview architecture.cyjs
-.fi
-
-Use a named scheme:
-.nf
-cyview --styles print architecture.cyjs
-.fi
-
-Set a default scheme via environment:
-.nf
-export CYVIEW_STYLES=print
-cyview architecture.cyjs
-.fi
-
-Do not open a browser; just print the URL:
-.nf
-cyview --ui print-url architecture.cyjs
-.fi
-
-Exit after the first successful page load:
-.nf
-cyview --once architecture.cyjs
-.fi
-
-.SH FILES
-.TP
-.B /etc/cyview/
-System-wide style overrides directory.
-.TP
-.B ~/.config/cyview/
-User style overrides directory.
-.TP
-.B cyview.styles
-Default scheme style file name.
-.TP
-.B cyview.styles.NAME
-Named scheme style file name.
-
-.SH EXIT STATUS
-.TP
-.B 0
-Success.
-.TP
-.B 2
-Usage error or input/parse/bind error.
-.TP
-.B 3
-Requested UI mode is unavailable (e.g., \fB--ui chromium\fR without Chromium or without a GUI).
-
-.SH NOTES
-\fBxdg-open\fR does not provide a reliable way to detect when the user closes the browser window.
-Chromium app mode is used when available because it provides a dedicated window and allows \fBcyview\fR to exit when that window closes.
 
 .SH SEE ALSO
 .BR xdg-open (1),

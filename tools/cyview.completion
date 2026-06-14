@@ -1,0 +1,58 @@
+# cyview bash completion (options + values + files)
+
+_cyview_complete() {
+  local cur prev
+  cur="${COMP_WORDS[COMP_CWORD]}"
+  prev="${COMP_WORDS[COMP_CWORD-1]}"
+
+  # Make bash treat completions as filenames when appropriate
+  # (handles slashes, spaces, etc.)
+  compopt -o filenames 2>/dev/null
+
+  # ---- option value completion ----
+  case "$prev" in
+    --styles)
+      local schemes
+      schemes="$(cyview --styles list 2>/dev/null)"
+      COMPREPLY=( $(compgen -W "$schemes" -- "$cur") )
+      return 0
+      ;;
+    --ui)
+      COMPREPLY=( $(compgen -W "auto chromium xdg-open print-url" -- "$cur") )
+      return 0
+      ;;
+    --emit)
+      COMPREPLY=( $(compgen -W "json" -- "$cur") )
+      return 0
+      ;;
+    --bind|--port)
+      # user types value
+      COMPREPLY=()
+      return 0
+      ;;
+  esac
+
+  # ---- flag completion ----
+  if [[ "$cur" == -* ]]; then
+    COMPREPLY=( $(compgen -W \
+      "--ui --styles --bind --port --once --emit --keep-alive -h --help" \
+      -- "$cur") )
+    return 0
+  fi
+
+  # ---- positional argument: directories + *.cyjs ----
+  # Let user tab through directories, and also pick .cyjs files.
+  local IFS=$'\n'
+  local candidates=()
+  local m
+  for m in $(compgen -f -- "$cur"); do
+    if [[ -d "$m" || "$m" == *.cyjs ]]; then
+      candidates+=( "$m" )
+    fi
+  done
+  COMPREPLY=( "${candidates[@]}" )
+  return 0
+}
+
+# -o filenames is important for proper path completion behavior
+complete -o filenames -F _cyview_complete cyview

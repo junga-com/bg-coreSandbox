@@ -1,0 +1,9 @@
+[ bg-core ]
+url=git@github.com:junga-com/bg-core
+branch=master
+commit=88ebe21bc3df25e5f234f17b459a287496aba15f
+
+[ bg-dev ]
+url=git@github.com:junga-com/bg-dev
+branch=master
+commit=b726ed11bff5e909866ee083b5ecfac828e41542

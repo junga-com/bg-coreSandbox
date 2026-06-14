@@ -1,4 +1,123 @@
 #!/usr/bin/env python3
+
+# -----------------------------------------------------------------------------
+# cyview – Handoff Summary (for future maintenance)
+#
+# Purpose
+# -------
+# cyview is a small Linux CLI tool that displays Cytoscape.js JSON graphs
+# ("CYJS", typically stored as *.cyjs). It is meant to be a generic viewer that
+# other tools can invoke after generating CYJS output, and can be registered as
+# the handler for the .cyjs extension so xdg-open/file managers open graphs.
+#
+# High-level behavior
+# -------------------
+# - Reads CYJS either from:
+#     * a file path argument (graph.cyjs)
+#     * stdin (explicit '-' or piped input)
+# - Creates a temp session directory containing:
+#     * viewer.html (Cytoscape.js page)
+#     * the CYJS file (served via local HTTP)
+# - Starts a tiny local HTTP server (ThreadingHTTPServer)
+# - Opens the viewer via:
+#     * Chromium/Chrome in --app mode (preferred, if available + GUI)
+#     * otherwise xdg-open
+#     * or --ui print-url which prints the URL and does not open a browser
+# - In Chromium mode, cyview waits for Chromium to close and then exits.
+#   In xdg-open mode, it cannot detect browser closure reliably; it runs until
+#   Ctrl+C or until --once triggers (best-effort).
+#
+# CLI options (current design)
+# ----------------------------
+# - --ui {auto|chromium|xdg-open|print-url}
+# - --bind ADDR (default 127.0.0.1)
+# - --port PORT (default 0 = ephemeral)
+# - --once      : exit after viewer.html is first served (best-effort)
+# - --emit json : machine-readable output (url/bind/port/ui/source/styles)
+# - --keep-alive: debugging; don't auto-exit on chromium close
+#
+# Styling system (key feature)
+# ----------------------------
+# cyview dynamically builds Cytoscape style selector blocks:
+#
+# 1) Start with hard-coded DEFAULT_STYLES in the script
+#    (includes text wrapping, label backgrounds for readability, etc.)
+#
+# 2) Then apply zero or more external style files (JSON) in this order:
+#      /etc/cyview/
+#      ~/.config/cyview/
+#      <cyjs file directory>   (only when input is a file)
+#      <current working directory (PWD)>
+#
+# 3) Styles files are named by a "scheme":
+#      scheme=default -> "cyview.styles"
+#      scheme=NAME    -> "cyview.styles.NAME"
+#
+# 4) Scheme selection precedence:
+#      --styles NAME (CLI) overrides
+#      else CYVIEW_STYLES env var
+#      else default
+#
+# 5) Styles file format:
+#      - JSON array of selector blocks, OR
+#      - JSON object containing {"style": [...]} or {"styles": [...]}
+#
+# 6) Replace semantics:
+#      If the first line (leading whitespace allowed) is "# replace",
+#      the running style list is cleared before appending JSON that follows.
+#      If nothing follows "# replace", the resulting style list is empty.
+#
+# 7) Merge semantics:
+#      Style blocks are appended; later blocks override earlier ones when
+#      selectors overlap (Cytoscape.js resolves later styles last).
+#
+# 8) Tab-completion helper:
+#      `--styles list` prints discovered scheme names (one per line) and exits.
+#      Discovery scans the same search directories for cyview.styles and
+#      cyview.styles.* files. Always includes "default".
+#
+# Important bug/lesson learned (HTML_TEMPLATE)
+# -------------------------------------------
+# We initially had a blank page with:
+#   viewer.html: Uncaught SyntaxError: Unexpected token '{'
+# Root causes:
+# - Template contained double braces "{{" / "}}" (leftover from .format() style),
+#   which broke JavaScript syntax when we switched to .replace().
+# - Inlining JSON as a JS literal inside <script> can be fragile.
+#
+# Fix:
+# - Use a clean HTML_TEMPLATE with normal braces.
+# - Embed the styles JSON in a <script type="application/json"> tag and parse it
+#   via JSON.parse(), rather than injecting as code.
+# - Use json.dumps(..., ensure_ascii=True) when embedding JSON text.
+#
+# Debugging workflow
+# ------------------
+# - Use: `cyview --ui print-url --emit json graph.cyjs`
+# - Open URL in a normal browser window and use DevTools Console/Network:
+#   * syntax errors => template/JSON injection problem
+#   * failed fetch  => serving/path issue
+#   * cytoscape undefined => CDN load/network issue
+#
+# Man page
+# --------
+# Documentation is maintained as `cyview.1` (section 1 CLI tool), covering:
+# - usage, input format, options
+# - styles configuration, scheme naming, search order
+# - CYVIEW_STYLES env var
+# - --styles list for tab completion
+#
+# Bash completion (external snippet)
+# ---------------------------------
+# Bash completion was built to complete:
+# - flags
+# - --ui values
+# - --emit values
+# - --styles schemes using `cyview --styles list`
+# - positional *.cyjs files (and directories) using filename completion options
+# -----------------------------------------------------------------------------
+
+
 import argparse
 import json
 import os
@@ -11,7 +130,7 @@ import threading
 import time
 from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Set
 
 # ----------------------------
 # Default Cytoscape.js styles
@@ -27,11 +146,9 @@ DEFAULT_STYLES: List[Dict[str, Any]] = [
             "text-valign": "center",
             "text-halign": "center",
             "font-size": 12,
-
             "background-color": "#4f7cff",
             "shape": "roundrectangle",
             "padding": "10px",
-
             "color": "#111",
             "text-background-color": "#ffffff",
             "text-background-opacity": 0.95,
@@ -56,13 +173,11 @@ DEFAULT_STYLES: List[Dict[str, Any]] = [
             "text-rotation": "autorotate",
             "text-wrap": "wrap",
             "text-max-width": 180,
-
             "curve-style": "bezier",
             "target-arrow-shape": "triangle",
             "line-color": "#999",
             "target-arrow-color": "#999",
             "width": 2,
-
             "color": "#111",
             "text-background-color": "#ffffff",
             "text-background-opacity": 0.85,
@@ -86,14 +201,21 @@ HTML_TEMPLATE = """<!doctype html>
 <head>
   <meta charset="utf-8" />
   <title>CYJS Viewer</title>
+
   <script src="https://unpkg.com/cytoscape@3.25.0/dist/cytoscape.min.js"></script>
+
   <style>
-    html, body, #cy { width: 100%; height: 100%; margin: 0; }
-    #info {{
+    html, body, #cy {
+      width: 100%;
+      height: 100%;
+      margin: 0;
+    }
+
+    #info {
       position: fixed;
       top: 8px;
       left: 8px;
-      background: rgba(255,255,255,0.92);
+      background: rgba(255, 255, 255, 0.92);
       padding: 8px;
       border-radius: 8px;
       font-family: sans-serif;
@@ -102,40 +224,49 @@ HTML_TEMPLATE = """<!doctype html>
       max-height: 45vh;
       overflow: auto;
       white-space: pre;
-      box-shadow: 0 2px 10px rgba(0,0,0,0.12);
-    }}
+      box-shadow: 0 2px 10px rgba(0, 0, 0, 0.12);
+      z-index: 10;
+    }
   </style>
 </head>
+
 <body>
   <div id="cy"></div>
   <div id="info">Click a node or edge…</div>
 
+  <!-- Styles injected as pure JSON -->
+  <script id="cyview-styles" type="application/json">
+__CYVIEW_STYLES_JSON__
+  </script>
+
   <script>
-    async function main() {{
-      const res = await fetch("__CYJS_FILE__");
-      const cyjs = await res.json();
+    async function main() {
+      const cyjsResp = await fetch("__CYJS_FILE__");
+      const cyjs = await cyjsResp.json();
 
-      const styles = __CYVIEW_STYLES__;
+      const stylesText = document.getElementById("cyview-styles").textContent;
+      const styles = JSON.parse(stylesText);
 
-      const cy = cytoscape({{
+      const cy = cytoscape({
         container: document.getElementById("cy"),
         elements: cyjs.elements,
         style: styles,
-        layout: {{ name: "cose" }}
-      }});
+        layout: { name: "cose" }
+      });
 
       const info = document.getElementById("info");
-      cy.on("tap", "node,edge", e => {{
-        info.textContent = JSON.stringify(e.target.data(), null, 2);
-      }});
-    }}
+      cy.on("tap", "node, edge", function (evt) {
+        info.textContent = JSON.stringify(evt.target.data(), null, 2);
+      });
+    }
 
-    main();
+    main().catch(err => {
+      console.error("cyview init failed:", err);
+    });
   </script>
 </body>
 </html>
 """
-
 
 # ----------------------------
 # Helpers
@@ -182,11 +313,6 @@ def read_cyjs_from_file(path: Path) -> str:
 
 
 def parse_styles_json(text: str, src_path: Path) -> List[Dict[str, Any]]:
-    """
-    Accept either:
-      - a JSON array of selector blocks, or
-      - a JSON object containing {"style": [ ... ]} or {"styles": [ ... ]}.
-    """
     obj = json.loads(text)
     if isinstance(obj, list):
         return obj
@@ -199,10 +325,6 @@ def parse_styles_json(text: str, src_path: Path) -> List[Dict[str, Any]]:
 
 
 def load_style_file(path: Path) -> Tuple[bool, List[Dict[str, Any]]]:
-    """
-    Returns (replace, styles_to_append).
-    Replace is true when first line is '# replace' (forgiving of leading whitespace).
-    """
     raw = path.read_text(encoding="utf-8")
     lines = raw.splitlines(True)
     if not lines:
@@ -214,7 +336,7 @@ def load_style_file(path: Path) -> Tuple[bool, List[Dict[str, Any]]]:
     if replace:
         rest = "".join(lines[1:]).strip()
         if not rest:
-            return (True, [])  # explicitly no styles
+            return (True, [])
         return (True, parse_styles_json(rest, path))
 
     if not raw.strip():
@@ -223,10 +345,6 @@ def load_style_file(path: Path) -> Tuple[bool, List[Dict[str, Any]]]:
 
 
 def scheme_to_filename(scheme: str) -> str:
-    """
-    'default' -> 'cyview.styles'
-    other     -> 'cyview.styles.<scheme>'
-    """
     s = scheme.strip()
     if not s or s == "default":
         return "cyview.styles"
@@ -234,16 +352,60 @@ def scheme_to_filename(scheme: str) -> str:
 
 
 def resolve_styles_scheme(cli_value: Optional[str]) -> str:
-    """
-    Precedence:
-      1) --styles NAME (if provided)
-      2) CYVIEW_STYLES env var (if set and non-empty)
-      3) default
-    """
+    # Special sentinel: "list" handled by caller before normal flow.
     if cli_value is not None:
         return cli_value.strip() or "default"
     env = os.environ.get("CYVIEW_STYLES", "").strip()
     return env or "default"
+
+
+def style_search_dirs(cyjs_source_file: Optional[Path], pwd: Path) -> List[Path]:
+    dirs: List[Path] = [
+        Path("/etc/cyview"),
+        Path.home() / ".config" / "cyview",
+    ]
+    if cyjs_source_file is not None:
+        dirs.append(cyjs_source_file.parent)
+    dirs.append(pwd)
+    # de-dupe while preserving order
+    out: List[Path] = []
+    seen: Set[str] = set()
+    for d in dirs:
+        try:
+            d2 = d.resolve()
+        except Exception:
+            d2 = d
+        k = str(d2)
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append(d2)
+    return out
+
+
+def discover_style_schemes(cyjs_source_file: Optional[Path], pwd: Path) -> List[str]:
+    """
+    Discover available scheme names by scanning search dirs for:
+      - cyview.styles           -> scheme "default"
+      - cyview.styles.<name>    -> scheme "<name>"
+    Returns sorted unique names, always including "default".
+    """
+    schemes: Set[str] = {"default"}
+    for d in style_search_dirs(cyjs_source_file, pwd):
+        if not d.exists() or not d.is_dir():
+            continue
+        # default
+        if (d / "cyview.styles").is_file():
+            schemes.add("default")
+        # named schemes
+        for p in d.glob("cyview.styles.*"):
+            if not p.is_file():
+                continue
+            # scheme is suffix after "cyview.styles."
+            name = p.name[len("cyview.styles."):]
+            if name:
+                schemes.add(name)
+    return sorted(schemes)
 
 
 def build_styles_collection(
@@ -251,44 +413,13 @@ def build_styles_collection(
     pwd: Path,
     scheme: str
 ) -> List[Dict[str, Any]]:
-    """
-    Styles resolution order (later appends win):
-      1) hard-coded defaults
-      2) /etc/cyview/<stylesfile>
-      3) ~/.config/cyview/<stylesfile>
-      4) <cyjs file dir>/<stylesfile>   (if input is a file)
-      5) <PWD>/<stylesfile>
-    Where <stylesfile> is:
-      - cyview.styles                 when scheme=default
-      - cyview.styles.<schemeName>    otherwise
-    If a styles file starts with '# replace' (leading whitespace ok), the running list is cleared.
-    """
     styles: List[Dict[str, Any]] = list(DEFAULT_STYLES)
     stylesfile = scheme_to_filename(scheme)
 
-    folders: List[Path] = [
-        Path("/etc/cyview"),
-        Path.home() / ".config" / "cyview",
-    ]
-    if cyjs_source_file is not None:
-        folders.append(cyjs_source_file.parent)
-    folders.append(pwd)
-
-    seen = set()
-    for folder in folders:
-        try:
-            folder = folder.resolve()
-        except Exception:
-            pass
-        key = str(folder)
-        if key in seen:
-            continue
-        seen.add(key)
-
+    for folder in style_search_dirs(cyjs_source_file, pwd):
         sp = folder / stylesfile
         if not sp.exists() or not sp.is_file():
             continue
-
         try:
             replace, add_styles = load_style_file(sp)
             if replace:
@@ -298,7 +429,6 @@ def build_styles_collection(
             print(f"cyview: warning: ignoring invalid styles file {sp}: {e}", file=sys.stderr)
 
     return styles
-
 
 # ----------------------------
 # HTTP Handler with --once support
@@ -333,7 +463,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(
         prog="cyview",
         description="Serve and view Cytoscape.js JSON graphs (.cyjs).",
-        epilog="See `man cyview` for full documentation (including cyview.styles).",
+        epilog="See `man cyview` for full documentation (including cyview.styles and --styles list).",
     )
     ap.add_argument(
         "input",
@@ -351,7 +481,7 @@ def main() -> int:
         "--styles",
         default=None,
         metavar="NAME",
-        help="Style scheme name (default: 'default'). Also configurable via $CYVIEW_STYLES.",
+        help="Style scheme name (default: 'default'). Also configurable via $CYVIEW_STYLES. Use 'list' to show schemes.",
     )
     ap.add_argument("--bind", default="127.0.0.1", help="Bind address (default: 127.0.0.1).")
     ap.add_argument("--port", type=int, default=0, help="Port (default: 0 = auto).")
@@ -361,20 +491,33 @@ def main() -> int:
 
     args = ap.parse_args()
 
-    scheme = resolve_styles_scheme(args.styles)
-
-    # Decide input source
+    # Decide input source early so we can discover schemes relative to file dir.
     piped = not sys.stdin.isatty()
     from_stdin = (args.input == "-") or (args.input is None and piped)
 
     cyjs_source_file: Optional[Path] = None
+    if (not from_stdin) and args.input:
+        cyjs_source_file = Path(args.input).expanduser().resolve()
+
+    pwd = Path.cwd()
+
+    # Tab-completion friendly mode: list schemes and exit.
+    if args.styles is not None and args.styles.strip() == "list":
+        for name in discover_style_schemes(cyjs_source_file=cyjs_source_file, pwd=pwd):
+            print(name)
+        return 0
+
+    scheme = resolve_styles_scheme(args.styles)
+
+    # Read CYJS
     try:
         if from_stdin:
             cyjs_text = read_cyjs_from_stdin()
             src_label = "stdin"
             cyjs_filename = "graph.cyjs"
         elif args.input:
-            cyjs_source_file = Path(args.input).expanduser().resolve()
+            if cyjs_source_file is None:
+                cyjs_source_file = Path(args.input).expanduser().resolve()
             cyjs_text = read_cyjs_from_file(cyjs_source_file)
             src_label = str(cyjs_source_file)
             cyjs_filename = cyjs_source_file.name
@@ -405,20 +548,21 @@ def main() -> int:
     else:
         ui_selected = "chromium" if (chromium and have_gui()) else "xdg-open"
 
-    pwd = Path.cwd()
     styles = build_styles_collection(cyjs_source_file=cyjs_source_file, pwd=pwd, scheme=scheme)
 
     with tempfile.TemporaryDirectory(prefix="cyview-session-") as td:
         session_dir = Path(td)
 
         (session_dir / cyjs_filename).write_text(cyjs_text, encoding="utf-8")
-        styles_json = json.dumps(styles, ensure_ascii=False)
+
+        styles_json = json.dumps(styles, ensure_ascii=True)
 
         html = (
             HTML_TEMPLATE
             .replace("__CYJS_FILE__", cyjs_filename)
-            .replace("__CYVIEW_STYLES__", styles_json)
+            .replace("__CYVIEW_STYLES_JSON__", styles_json)
         )
+
         (session_dir / "viewer.html").write_text(html, encoding="utf-8")
 
         once_event = threading.Event() if args.once else None
@@ -445,7 +589,6 @@ def main() -> int:
                 "styles": scheme,
             })
 
-        # print-url mode
         if ui_selected == "print-url":
             if args.emit != "json":
                 print(url, flush=True)
@@ -462,7 +605,6 @@ def main() -> int:
                 httpd.server_close()
             return 0
 
-        # chromium mode
         if ui_selected == "chromium" and chromium:
             profile_dir = tempfile.mkdtemp(prefix="cyview-chromium-profile-")
             try:
@@ -529,7 +671,6 @@ def main() -> int:
                 httpd.server_close()
             return 0
 
-        # xdg-open mode
         subprocess.run(["xdg-open", url], check=False)
         try:
             if once_event:

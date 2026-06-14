@@ -1,7 +1,7 @@
 {
         "elements": {
             "nodes": [
-                {"data": {"id": "a", "label": "a"}},
+                {"data": {"id": "a", "label": "a\r\n(this is a)"}},
                 {"data": {"id": "b", "label": "b"}}
             ],
             "edges": [

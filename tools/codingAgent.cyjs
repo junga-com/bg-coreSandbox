@@ -1,0 +1,119 @@
+{
+  "format_version": "1.0",
+  "generated_by": "codingAgent",
+  "description": "codingAgent architecture (project-scoped, per-project docker stack, authoritative logging at OpenAI-compatible proxy)",
+  "elements": {
+    "nodes": [
+      { "data": { "id": "project", "label": "Project Folder\n<projectPath>\n(source of truth)" } },
+      { "data": { "id": "agents_dir", "label": ".agents/\n(canonical state)\n+ _runtime/_cache", "parent": "project" } },
+
+      { "data": { "id": "cli", "label": "codingAgent CLI\ncodingAgent <projectPath>" } },
+      { "data": { "id": "browser", "label": "UI\nChromium --app\n(or default browser)" } },
+
+      { "data": { "id": "docker_stack", "label": "Per-Project Docker Stack\n(reusable/disposable)\n(mounts <projectPath> as /work)" } },
+
+      { "data": { "id": "librechat", "label": "Agent Runner UI\n(LibreChat)\nHTTP server + chat UX", "parent": "docker_stack" } },
+      { "data": { "id": "proxy", "label": "OpenAI-Compatible Proxy\n+ Authoritative Logger\n(request/response/tool capture)", "parent": "docker_stack" } },
+      { "data": { "id": "mcp_fs", "label": "MCP Filesystem Server\n(scoped to /work)", "parent": "docker_stack" } },
+      { "data": { "id": "mongo", "label": "MongoDB\n(ephemeral cache)\nNOT source of truth", "parent": "docker_stack" } },
+
+      { "data": { "id": "upstream_llm", "label": "Upstream LLM\n(vLLM / OpenAI / etc.)" } }
+    ],
+    "edges": [
+      {
+        "data": {
+          "id": "e_cli_init_project",
+          "source": "cli",
+          "target": "project",
+          "label": "create/ensure .agents/, templates,\n.gitignore, runtime metadata"
+        }
+      },
+      {
+        "data": {
+          "id": "e_cli_start_stack",
+          "source": "cli",
+          "target": "docker_stack",
+          "label": "start/reuse per-project stack\n(container name derived from project)"
+        }
+      },
+      {
+        "data": {
+          "id": "e_cli_open_ui",
+          "source": "cli",
+          "target": "browser",
+          "label": "open http://localhost:<port>\n(Chromium --app optional)"
+        }
+      },
+
+      {
+        "data": {
+          "id": "e_browser_to_librechat",
+          "source": "browser",
+          "target": "librechat",
+          "label": "HTTP(S) chat UI\n(streaming, history, tool UX)"
+        }
+      },
+
+      {
+        "data": {
+          "id": "e_librechat_to_proxy",
+          "source": "librechat",
+          "target": "proxy",
+          "label": "OpenAI-compatible requests\n(model provider interface)"
+        }
+      },
+      {
+        "data": {
+          "id": "e_proxy_to_upstream",
+          "source": "proxy",
+          "target": "upstream_llm",
+          "label": "forward completions/tool protocol\n(actual inference)"
+        }
+      },
+
+      {
+        "data": {
+          "id": "e_librechat_to_mcp",
+          "source": "librechat",
+          "target": "mcp_fs",
+          "label": "MCP tool calls\n(read/write project files)"
+        }
+      },
+
+      {
+        "data": {
+          "id": "e_mcp_to_project",
+          "source": "mcp_fs",
+          "target": "project",
+          "label": "file IO via /work bind mount\n(scoped access)"
+        }
+      },
+      {
+        "data": {
+          "id": "e_proxy_to_agents",
+          "source": "proxy",
+          "target": "agents_dir",
+          "label": "authoritative append-only logging\n.agents/agents/<agentId>/history.jsonl"
+        }
+      },
+
+      {
+        "data": {
+          "id": "e_librechat_to_mongo",
+          "source": "librechat",
+          "target": "mongo",
+          "label": "ephemeral cache/session data\nNOT trusted for persistence"
+        }
+      },
+
+      {
+        "data": {
+          "id": "e_project_mount_stack",
+          "source": "project",
+          "target": "docker_stack",
+          "label": "bind mount <projectPath> → /work\n(docker boundary)"
+        }
+      }
+    ]
+  }
+}
