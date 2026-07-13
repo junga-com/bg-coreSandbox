@@ -1,14 +1,14 @@
 [ bg-core-bash-builtins ]
 url=git@github.com:junga-com/bg-core-bash-builtins
 branch=master
-commit=13a763638e844f5ee6ab13504a645352682668a3
+commit=6976bc88c7b3a31d56b33be7d1733416343a80b6
 
 [ bg-core ]
 url=git@github.com:junga-com/bg-core
 branch=master
-commit=b89c51a4f74ac849a4f96dee57826daa2a56b1fc
+commit=ebd2713129fc68a7fb6e38ff3ccc945eea7e77c4
 
 [ bg-dev ]
 url=git@github.com:junga-com/bg-dev
 branch=master
-commit=9eddff5275fba973ba6761a36c44dc6b3031f889
+commit=bf49b74bdc005878b88471ed585adbe20e9e9e84
