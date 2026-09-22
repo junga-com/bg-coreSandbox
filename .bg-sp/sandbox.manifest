@@ -6,9 +6,9 @@ commit=68fc7d4151089d8ca36fb700d4553d56c5d520b9
 [ bg-core ]
 url=git@github.com:junga-com/bg-core
 branch=master
-commit=ee495a1bd00a5b0ed036eeab7dd0f2a84584c842
+commit=eee777cde5aad73d9da6bfbb443d61c47ace1e0c
 
 [ bg-dev ]
 url=git@github.com:junga-com/bg-dev
 branch=master
-commit=bf49b74bdc005878b88471ed585adbe20e9e9e84
+commit=b4be5b4792895993afb0593a1f6a55e9074ec13f
